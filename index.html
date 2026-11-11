@@ -41,6 +41,7 @@
 <main>
   <h1>Leaf Classifier</h1>
   <p class="sub">Point the rear camera at a leaf inside the square, or upload a photo.</p>
+  <p class="sub">Model: <a href="./">Task 2 (original)</a> · <a href="./?model=c3">Task 4 – C3 (improved)</a></p>
 
   <div class="card">
     <div class="view">
@@ -116,7 +117,7 @@ async function init() {
   session = await ort.InferenceSession.create(useC3 ? "leaf_model_c3.onnx" : "leaf_model.onnx", { executionProviders: ["wasm"] });
   inputName = session.inputNames[0];
   outputName = session.outputNames[0];
-  statusEl.textContent = useC3 ? "Model ready (leaf_model_c3.onnx)." : "Model ready.";
+  statusEl.textContent = useC3 ? "Model ready – Task 4 C3 (leaf_model_c3.onnx). Self-test applies only to the original model." : "Model ready – Task 2 original (leaf_model.onnx).";
 }
 const ready = init().catch((e) => { statusEl.textContent = "Model failed to load: " + e.message; throw e; });
 
