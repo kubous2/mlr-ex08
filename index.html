@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Leaf Classifier</title>
+<style>
+  :root { --bg:#f6f7f4; --fg:#1d2420; --muted:#5d6a62; --card:#fff; --accent:#2f7d4f; --bar:#e3e8e4; --line:#d6ddd8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141816; --fg:#e7ece9; --muted:#9aa8a0; --card:#1e2420; --accent:#5cc488; --bar:#2c3430; --line:#323b36; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px; padding-bottom:calc(16px + env(safe-area-inset-bottom)); }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 14px; font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .view { position:relative; width:100%; aspect-ratio:1/1; background:#000; border-radius:10px; overflow:hidden; }
+  .view video, .view img { width:100%; height:100%; object-fit:cover; display:block; }
+  .view .frame { position:absolute; inset:0; border:2px dashed rgba(255,255,255,.6); border-radius:10px; pointer-events:none; }
+  .hidden { display:none !important; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  button, .btn { appearance:none; border:0; border-radius:10px; padding:10px 14px; font:inherit; font-weight:600; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary, .btn.secondary { background:var(--bar); color:var(--fg); }
+  #status { color:var(--muted); font-size:.85rem; margin-top:8px; min-height:1.2em; }
+  .top { font-size:1.25rem; font-weight:700; margin-bottom:8px; }
+  .cls { display:grid; grid-template-columns:80px 1fr 64px; gap:8px; align-items:center; margin:6px 0; }
+  .cls .name { text-transform:capitalize; }
+  .cls .track { height:14px; background:var(--bar); border-radius:7px; overflow:hidden; }
+  .cls .fill { height:100%; width:0; background:var(--accent); transition:width .15s; }
+  .cls .pct { text-align:right; font-variant-numeric:tabular-nums; font-size:.9rem; }
+  .qr { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  .qr h2 { font-size:1rem; margin:0 0 6px; }
+  #qr { background:#fff; padding:8px; border-radius:8px; line-height:0; }
+  #qr svg { width:150px; height:150px; }
+  .qr a { color:var(--accent); word-break:break-all; font-weight:600; }
+  #selftest { font-size:.85rem; color:var(--muted); white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Leaf Classifier</h1>
+  <p class="sub">Point the rear camera at a leaf inside the square, or upload a photo.</p>
+
+  <div class="card">
+    <div class="view">
+      <video id="video" playsinline muted autoplay></video>
+      <img id="photo" class="hidden" alt="Uploaded photo">
+      <div class="frame"></div>
+    </div>
+    <div class="row">
+      <button id="startBtn">Start camera</button>
+      <label class="btn secondary" for="file">Upload photo</label>
+      <input id="file" type="file" accept="image/*" class="hidden">
+    </div>
+    <div id="status">Loading model…</div>
+  </div>
+
+  <div class="card">
+    <div class="top" id="top">–</div>
+    <div id="probs"></div>
+  </div>
+
+  <div class="card">
+    <button class="secondary" id="testBtn">Run self-test (check_image.jpg)</button>
+    <div id="selftest"></div>
+  </div>
+
+  <div class="card qr">
+    <div id="qr" aria-label="QR code"></div>
+    <div>
+      <h2>Open this app on your phone</h2>
+      <p class="sub" style="margin:0 0 6px">Scan the QR code or tap the link:</p>
+      <a id="appLink" href="https://kubous2.github.io/mlr-ex08/">https://kubous2.github.io/mlr-ex08/</a>
+    </div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script>
+"use strict";
+const APP_URL = "https://kubous2.github.io/mlr-ex08/";
+
+// --- QR code (generated in the browser) ---
+(function () {
+  const qr = qrcode(0, "M");
+  qr.addData(APP_URL);
+  qr.make();
+  document.getElementById("qr").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true });
+  document.getElementById("qr").dataset.url = APP_URL;
+})();
+
+// --- Model ---
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+ort.env.wasm.numThreads = 1; // GitHub Pages has no cross-origin isolation; required for iOS Safari
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+let info, session, inputName, outputName, size;
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+function buildBars() {
+  $("probs").innerHTML = info.classes.map((c, i) =>
+    `<div class="cls"><span class="name">${c}</span><div class="track"><div class="fill" id="f${i}"></div></div><span class="pct" id="p${i}">–</span></div>`
+  ).join("");
+}
+
+async function init() {
+  info = await (await fetch("model_info.json")).json();
+  size = info.input_size;
+  canvas.width = canvas.height = size;
+  buildBars();
+  session = await ort.InferenceSession.create("leaf_model.onnx", { executionProviders: ["wasm"] });
+  inputName = session.inputNames[0];
+  outputName = session.outputNames[0];
+  statusEl.textContent = "Model ready.";
+}
+const ready = init().catch((e) => { statusEl.textContent = "Model failed to load: " + e.message; throw e; });
+
+// Crop central square of source, resize to size×size, scale to 0–1, standardize, NCHW.
+function preprocess(source, w, h) {
+  const s = Math.min(w, h);
+  const sx = (w - s) / 2, sy = (h - s) / 2;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.clearRect(0, 0, size, size);
+  ctx.drawImage(source, sx, sy, s, s, 0, 0, size, size);
+  const px = ctx.getImageData(0, 0, size, size).data;
+  const n = size * size;
+  const data = new Float32Array(3 * n);
+  const { mean, std } = info;
+  for (let i = 0; i < n; i++) {
+    data[i]         = (px[i * 4]     / 255 - mean[0]) / std[0];
+    data[n + i]     = (px[i * 4 + 1] / 255 - mean[1]) / std[1];
+    data[2 * n + i] = (px[i * 4 + 2] / 255 - mean[2]) / std[2];
+  }
+  return new ort.Tensor("float32", data, [1, 3, size, size]);
+}
+
+function softmax(logits) {
+  const m = Math.max(...logits);
+  const e = Array.from(logits, (v) => Math.exp(v - m));
+  const sum = e.reduce((a, b) => a + b, 0);
+  return e.map((v) => v / sum);
+}
+
+let busy = false;
+async function classify(source, w, h) {
+  const out = await session.run({ [inputName]: preprocess(source, w, h) });
+  return softmax(out[outputName].data);
+}
+
+function show(probs) {
+  let best = 0;
+  probs.forEach((p, i) => {
+    $("f" + i).style.width = (p * 100).toFixed(1) + "%";
+    $("p" + i).textContent = (p * 100).toFixed(1) + "%";
+    if (p > probs[best]) best = i;
+  });
+  $("top").textContent = `${info.classes[best]} — ${(probs[best] * 100).toFixed(1)}%`;
+}
+
+// --- Camera (live) ---
+const video = $("video"), photo = $("photo");
+let stream = null, live = false;
+
+async function startCamera() {
+  await ready;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 1280 } }
+    });
+  } catch (e) {
+    statusEl.textContent = "Camera unavailable (" + e.name + "). Use “Upload photo” instead.";
+    return;
+  }
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  photo.classList.add("hidden");
+  video.classList.remove("hidden");
+  $("startBtn").textContent = "Stop camera";
+  statusEl.textContent = "Live classification running.";
+  live = true;
+  loop();
+}
+
+function stopCamera() {
+  live = false;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  video.srcObject = null;
+  $("startBtn").textContent = "Start camera";
+}
+
+async function loop() {
+  if (!live) return;
+  if (!busy && video.readyState >= 2 && video.videoWidth) {
+    busy = true;
+    try { show(await classify(video, video.videoWidth, video.videoHeight)); }
+    catch (e) { statusEl.textContent = "Inference error: " + e.message; }
+    busy = false;
+  }
+  requestAnimationFrame(loop);
+}
+
+$("startBtn").addEventListener("click", () => (live ? stopCamera() : startCamera()));
+
+// --- Photo upload (fallback) ---
+function loadImage(src) {
+  return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = src; });
+}
+
+$("file").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  stopCamera();
+  await ready;
+  const url = URL.createObjectURL(f);
+  try {
+    const im = await loadImage(url);
+    photo.src = url;
+    photo.classList.remove("hidden");
+    video.classList.add("hidden");
+    show(await classify(im, im.naturalWidth, im.naturalHeight));
+    statusEl.textContent = "Classified uploaded photo.";
+  } catch (e) {
+    statusEl.textContent = "Could not read image: " + e.message;
+  }
+  ev.target.value = "";
+});
+
+// --- Self-test against check_expected.json ---
+async function selfTest() {
+  await ready;
+  const [im, expected] = await Promise.all([
+    loadImage("check_image.jpg"),
+    fetch("check_expected.json").then((r) => r.json())
+  ]);
+  const probs = await classify(im, im.naturalWidth, im.naturalHeight);
+  let maxDiff = 0;
+  const lines = info.classes.map((c, i) => {
+    const d = Math.abs(probs[i] - expected[c]);
+    maxDiff = Math.max(maxDiff, d);
+    return `${c.padEnd(9)} got ${probs[i].toExponential(4)}  expected ${expected[c].toExponential(4)}`;
+  });
+  const pass = maxDiff < 1e-3;
+  const result = { pass, maxDiff, probs };
+  window.selfTestResult = result;
+  $("selftest").textContent = lines.join("\n") + `\nmax |diff| = ${maxDiff.toExponential(2)} → ${pass ? "PASS" : "FAIL"}`;
+  show(probs);
+  return result;
+}
+$("testBtn").addEventListener("click", () => selfTest().catch((e) => ($("selftest").textContent = "Error: " + e.message)));
+window.selfTest = selfTest;
+</script>
+</body>
+</html>
